@@ -1,4 +1,5 @@
 mod error;
+mod hdr_image;
 mod monitor;
 mod video_recorder;
 mod window;
@@ -26,6 +27,7 @@ mod platform;
 pub use image;
 
 pub use error::{XCapError, XCapResult};
+pub use hdr_image::HdrImage;
 pub use monitor::Monitor;
 pub use window::Window;
 

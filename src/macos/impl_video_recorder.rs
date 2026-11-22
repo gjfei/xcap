@@ -59,7 +59,16 @@ fn shareable_content() -> XCapResult<Retained<SCShareableContent>> {
             let _ = tx.send(result);
         },
     );
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
+    // Restrict enumeration to on-screen, non-desktop windows: on a busy
+    // desktop the full list carries ~150 off-screen windows we immediately
+    // discard, and the extra marshalling costs ~15 ms on every call (much
+    // more under load). `displays()` is unaffected, and the caller's own
+    // windows are on-screen, so the exclusion list stays identical.
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            true, true, &handler,
+        )
+    };
 
     match rx.recv_timeout(START_TIMEOUT) {
         Ok(Ok(content)) => Ok(content),
