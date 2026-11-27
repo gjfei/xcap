@@ -9,6 +9,9 @@ use std::{
 #[cfg(any(all(target_os = "windows", not(feature = "wgc")), test))]
 use std::sync::{Arc, atomic::AtomicUsize};
 
+/// Upper bound accepted for an explicit video recorder frame-rate cap.
+pub(crate) const MAX_FPS: u32 = 360;
+
 use crate::{HdrImage, XCapResult, platform::impl_video_recorder::ImplVideoRecorder};
 
 /// A rectangle in monitor units, the same space as [`crate::Monitor::capture_region`].
@@ -58,7 +61,11 @@ pub enum DynamicRange {
 /// Options for [`crate::Monitor::video_recorder_with_options`].
 #[derive(Debug, Clone)]
 pub struct VideoRecorderOptions {
-    /// Upper bound on the delivered frame rate, clamped to `1..=60`.
+    /// Upper bound on the delivered frame rate.
+    ///
+    /// `0` requests the monitor's native refresh rate (no artificial 60 fps
+    /// cap); `1..=360` caps delivery to at most that many frames per second
+    /// (values above `360` clamp to `360`).
     pub fps: u32,
     /// Sub-rectangle of the monitor to record, in monitor units.
     /// `None` records the whole monitor.
@@ -92,9 +99,29 @@ impl Default for VideoRecorderOptions {
 }
 
 impl VideoRecorderOptions {
+    /// Set the frame-rate cap (`0` for the monitor's native refresh rate, or
+    /// `1..=360` frames per second; values above `360` clamp to `360`).
     pub fn fps(mut self, fps: u32) -> Self {
-        self.fps = fps.clamp(1, 60);
+        self.fps = fps.min(MAX_FPS);
         self
+    }
+
+    /// Deliver frames at the monitor's native refresh rate without an
+    /// artificial frame-rate cap.
+    pub fn native_fps(mut self) -> Self {
+        self.fps = 0;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolved_frame_interval(&self) -> Option<Duration> {
+        if self.fps == 0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(
+                1.0 / self.fps.clamp(1, MAX_FPS) as f64,
+            ))
+        }
     }
 
     pub fn region(mut self, region: CaptureRegion) -> Self {
@@ -330,6 +357,11 @@ impl RecorderWaker {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn throttle_tolerance(interval: Duration) -> Duration {
+    Duration::from_millis(1).min(interval / 4)
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoRecorder {
     impl_video_recorder: ImplVideoRecorder,
@@ -379,5 +411,40 @@ mod tests {
         assert_eq!(depth.load(Ordering::Relaxed), 1);
         drop(frame);
         assert_eq!(depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fps_options_support_native_and_high_refresh_rates() {
+        let default = VideoRecorderOptions::default();
+        assert_eq!(default.fps, 60);
+        assert!(default.resolved_frame_interval().is_some());
+
+        let zero = VideoRecorderOptions::default().fps(0);
+        assert_eq!(zero.fps, 0);
+        assert!(zero.resolved_frame_interval().is_none());
+
+        let native = VideoRecorderOptions::default().native_fps();
+        assert_eq!(native.fps, 0);
+        assert!(native.resolved_frame_interval().is_none());
+
+        let hz120 = VideoRecorderOptions::default().fps(120);
+        assert_eq!(hz120.fps, 120);
+        let interval_240 = VideoRecorderOptions::default()
+            .fps(240)
+            .resolved_frame_interval()
+            .unwrap();
+        assert!(interval_240 < Duration::from_millis(5));
+
+        let clamped = VideoRecorderOptions::default().fps(1000);
+        assert_eq!(clamped.fps, MAX_FPS);
+    }
+
+    #[test]
+    fn throttle_tolerance_scales_with_high_refresh_intervals() {
+        let hz60 = Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(throttle_tolerance(hz60), Duration::from_millis(1));
+
+        let hz240 = Duration::from_secs_f64(1.0 / 240.0);
+        assert!(throttle_tolerance(hz240) <= hz240 / 4);
     }
 }

@@ -32,6 +32,7 @@ use crate::{
     XCapError, XCapResult,
     video_recorder::{
         CaptureRegion, DynamicRange, Frame, QueuePermit, RecorderWaker, VideoRecorderOptions,
+        throttle_tolerance,
     },
 };
 
@@ -97,7 +98,7 @@ impl ImplVideoRecorder {
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let recorder_waker = Arc::new(RecorderWaker::new());
         let region = options.region;
-        let interval = Duration::from_secs_f64(1.0 / options.fps.clamp(1, 60) as f64);
+        let interval = options.resolved_frame_interval();
         let created = Instant::now();
 
         let worker_waker = recorder_waker.clone();
@@ -182,7 +183,7 @@ fn run_sdr(
     recorder_waker: Arc<RecorderWaker>,
     tx: SyncSender<Frame>,
     region: Option<CaptureRegion>,
-    interval: Duration,
+    interval: Option<Duration>,
     created: Instant,
 ) -> XCapResult<()> {
     let mut last_frame_at: Option<Duration> = None;
@@ -217,10 +218,10 @@ fn run_sdr(
             source_texture.GetDesc(&mut source_texture_desc);
 
             let now = created.elapsed();
-            if let Some(last) = last_frame_at {
-                // One millisecond of tolerance keeps a 60 Hz source from
-                // skipping every other frame at a 60 fps cap.
-                if now.saturating_sub(last) + Duration::from_millis(1) < interval {
+            if let (Some(last), Some(interval)) = (last_frame_at, interval) {
+                // Allow slight sub-millisecond jitter so a matched source
+                // refresh rate does not skip every other VSync.
+                if now.saturating_sub(last) + throttle_tolerance(interval) < interval {
                     continue;
                 }
             }
@@ -337,7 +338,7 @@ fn run_hdr(
     tx: SyncSender<Frame>,
     queue_depth: Arc<AtomicUsize>,
     region: Option<CaptureRegion>,
-    interval: Duration,
+    interval: Option<Duration>,
     created: Instant,
 ) -> XCapResult<()> {
     let crop = region.map(|region| dxgi::Crop {
@@ -354,16 +355,19 @@ fn run_hdr(
 
         // Throttle before acquiring: converting a 4K HDR frame only to throw
         // it away costs far more than the frame check does.
-        if let Some(last) = last_frame_at {
+        if let (Some(last), Some(interval)) = (last_frame_at, interval) {
             let wait = interval.saturating_sub(created.elapsed().saturating_sub(last));
-            if !recorder_waker.wait_timeout(wait)? {
+            if !wait.is_zero() && !recorder_waker.wait_timeout(wait)? {
                 return Ok(());
             }
         }
         let Some(permit) = QueuePermit::acquire(queue_depth.clone(), FRAME_QUEUE_CAPACITY) else {
             // The receiver has not made room yet. Skip before DXGI grab and
             // HDR decode rather than paying for a frame that would be dropped.
-            if !recorder_waker.wait_timeout(interval)? {
+            let backoff = interval
+                .unwrap_or(Duration::from_millis(4))
+                .max(Duration::from_millis(2));
+            if !recorder_waker.wait_timeout(backoff)? {
                 return Ok(());
             }
             continue;

@@ -38,7 +38,7 @@ use scopeguard::defer;
 use super::hdr;
 use crate::{
     HdrImage, XCapError, XCapResult,
-    video_recorder::{DynamicRange, Frame, OutputSize, VideoRecorderOptions},
+    video_recorder::{DynamicRange, Frame, MAX_FPS, OutputSize, VideoRecorderOptions},
 };
 
 /// How long to wait for ScreenCaptureKit before giving up.
@@ -447,6 +447,7 @@ impl ImplVideoRecorder {
         display_width: u32,
         display_height: u32,
         scale_factor: f32,
+        refresh_rate: f32,
         options: VideoRecorderOptions,
     ) -> XCapResult<(Self, Receiver<Frame>)> {
         let created = Instant::now();
@@ -529,7 +530,18 @@ impl ImplVideoRecorder {
             _ => (pixel_width, pixel_height),
         };
 
-        let (tx, rx) = sync_channel(4);
+        let high_fps = options.fps == 0 || options.fps > 60;
+        let target_hz: i32 = if options.fps > 0 {
+            options.fps.min(MAX_FPS) as i32
+        } else if refresh_rate.is_finite() && refresh_rate >= 1.0 {
+            // Give ScreenCaptureKit +1 Hz of headroom over the nominal mode
+            // rate so 59.94 / 120.05 Hz clocks do not skip every other VSync.
+            (refresh_rate.ceil() as u32).saturating_add(1).min(MAX_FPS) as i32
+        } else {
+            240
+        };
+
+        let (tx, rx) = sync_channel(if high_fps { 6 } else { 4 });
         let running = Arc::new(AtomicBool::new(false));
         // HDR streaming needs Apple Silicon and macOS 15; asking on an older
         // Mac silently keeps the SDR stream, so only build the lookup when the
@@ -559,8 +571,8 @@ impl ImplVideoRecorder {
             configuration.setSourceRect(source_rect);
             configuration.setScalesToFit(false);
             configuration.setShowsCursor(options.captures_cursor);
-            configuration.setQueueDepth(5);
-            configuration.setMinimumFrameInterval(CMTime::new(1, options.fps.clamp(1, 60) as i32));
+            configuration.setQueueDepth(if high_fps { 8 } else { 5 });
+            configuration.setMinimumFrameInterval(CMTime::new(1, target_hz));
 
             let stream = SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),
