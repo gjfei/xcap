@@ -1,13 +1,13 @@
 use std::{
     sync::{
-        Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 #[cfg(any(all(target_os = "windows", not(feature = "wgc")), test))]
-use std::sync::{Arc, atomic::AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 /// Upper bound accepted for an explicit video recorder frame-rate cap.
 pub(crate) const MAX_FPS: u32 = 360;
@@ -58,6 +58,54 @@ pub enum DynamicRange {
     Hdr,
 }
 
+/// Thread-safe pool of reusable RGBA frame byte buffers.
+///
+/// Callers such as scroll capture can pass a shared pool into
+/// [`VideoRecorderOptions::buffer_pool`] and call [`Self::recycle`] once a
+/// captured frame buffer is no longer needed, avoiding repeated large heap
+/// allocations and zero-initialization on every frame.
+#[derive(Clone, Debug)]
+pub struct FrameBufferPool {
+    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+    max_buffers: usize,
+}
+
+impl FrameBufferPool {
+    pub fn new(max_buffers: usize) -> Self {
+        Self {
+            buffers: Arc::new(Mutex::new(Vec::with_capacity(max_buffers))),
+            max_buffers,
+        }
+    }
+
+    /// Take a cleared buffer with at least `len` bytes of capacity, or
+    /// allocate a fresh `Vec::with_capacity(len)`.
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        let mut guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        while let Some(mut buf) = guard.pop() {
+            let cap = buf.capacity();
+            if cap >= len && cap <= len.saturating_mul(2) {
+                buf.clear();
+                return buf;
+            }
+        }
+        drop(guard);
+        Vec::with_capacity(len)
+    }
+
+    /// Return a consumed buffer to the pool if space remains.
+    pub fn recycle(&self, mut buf: Vec<u8>) {
+        if self.max_buffers == 0 || buf.capacity() == 0 {
+            return;
+        }
+        let mut guard = self.buffers.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.len() < self.max_buffers {
+            buf.clear();
+            guard.push(buf);
+        }
+    }
+}
+
 /// Options for [`crate::Monitor::video_recorder_with_options`].
 #[derive(Debug, Clone)]
 pub struct VideoRecorderOptions {
@@ -83,6 +131,10 @@ pub struct VideoRecorderOptions {
     pub output_size: OutputSize,
     /// Ask for extended-range frames. See [`DynamicRange`].
     pub dynamic_range: DynamicRange,
+    /// Override the internal platform-to-caller sync channel depth (`1..=16`).
+    pub channel_capacity: Option<usize>,
+    /// Optional buffer pool reused by the platform capture callback.
+    pub buffer_pool: Option<FrameBufferPool>,
 }
 
 impl Default for VideoRecorderOptions {
@@ -94,6 +146,8 @@ impl Default for VideoRecorderOptions {
             excludes_own_windows: true,
             output_size: OutputSize::Native,
             dynamic_range: DynamicRange::Sdr,
+            channel_capacity: None,
+            buffer_pool: None,
         }
     }
 }
@@ -148,6 +202,16 @@ impl VideoRecorderOptions {
 
     pub fn dynamic_range(mut self, dynamic_range: DynamicRange) -> Self {
         self.dynamic_range = dynamic_range;
+        self
+    }
+
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = Some(capacity.clamp(1, 16));
+        self
+    }
+
+    pub fn buffer_pool(mut self, pool: FrameBufferPool) -> Self {
+        self.buffer_pool = Some(pool);
         self
     }
 }
@@ -446,5 +510,30 @@ mod tests {
 
         let hz240 = Duration::from_secs_f64(1.0 / 240.0);
         assert!(throttle_tolerance(hz240) <= hz240 / 4);
+    }
+
+    #[test]
+    fn frame_buffer_pool_reuses_matching_buffers_and_caps_idle_count() {
+        let pool = FrameBufferPool::new(2);
+        let a = Vec::with_capacity(128);
+        let b = Vec::with_capacity(128);
+        let c = Vec::with_capacity(128);
+        pool.recycle(a);
+        pool.recycle(b);
+        pool.recycle(c);
+
+        let reused1 = pool.take(128);
+        let reused2 = pool.take(128);
+        assert!(reused1.capacity() >= 128 && reused2.capacity() >= 128);
+        assert!(reused1.as_ptr() != reused2.as_ptr());
+
+        // Returning mismatched capacities discards buffers instead of handing back wrong sizes.
+        pool.recycle(vec![1u8; 64]);
+        let larger = pool.take(128);
+        assert!(larger.capacity() >= 128);
+
+        pool.recycle(vec![0u8; 512]);
+        let smaller = pool.take(128);
+        assert!(smaller.capacity() <= 256);
     }
 }

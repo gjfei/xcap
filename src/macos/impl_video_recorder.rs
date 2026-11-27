@@ -38,7 +38,9 @@ use scopeguard::defer;
 use super::hdr;
 use crate::{
     HdrImage, XCapError, XCapResult,
-    video_recorder::{DynamicRange, Frame, MAX_FPS, OutputSize, VideoRecorderOptions},
+    video_recorder::{
+        DynamicRange, Frame, FrameBufferPool, MAX_FPS, OutputSize, VideoRecorderOptions,
+    },
 };
 
 /// How long to wait for ScreenCaptureKit before giving up.
@@ -177,6 +179,50 @@ fn rgba_from_420v(
     rgba
 }
 
+fn bgra_to_rgba_into(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+    pool: Option<&FrameBufferPool>,
+) -> Vec<u8> {
+    let row_len = width * 4;
+    let total_len = row_len * height;
+    let mut buffer = pool.map_or_else(|| Vec::with_capacity(total_len), |p| p.take(total_len));
+    debug_assert!(buffer.capacity() >= total_len);
+    let dst = &mut buffer.spare_capacity_mut()[..total_len];
+    for y in 0..height {
+        let src_row = &data[y * bytes_per_row..y * bytes_per_row + row_len];
+        let dst_row = &mut dst[y * row_len..(y + 1) * row_len];
+        let mut offset = 0usize;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::{vld4q_u8, vst4q_u8};
+            while offset + 64 <= row_len {
+                // SAFETY: `offset + 64 <= row_len`, both `src_row` and `dst_row`
+                // cover at least `row_len` bytes, and `vld4q_u8`/`vst4q_u8` accept
+                // unaligned byte pointers.
+                unsafe {
+                    let mut px = vld4q_u8(src_row.as_ptr().add(offset));
+                    std::mem::swap(&mut px.0, &mut px.2);
+                    vst4q_u8(dst_row.as_mut_ptr().add(offset).cast::<u8>(), px);
+                }
+                offset += 64;
+            }
+        }
+        while offset + 4 <= row_len {
+            dst_row[offset].write(src_row[offset + 2]);
+            dst_row[offset + 1].write(src_row[offset + 1]);
+            dst_row[offset + 2].write(src_row[offset]);
+            dst_row[offset + 3].write(src_row[offset + 3]);
+            offset += 4;
+        }
+    }
+    // SAFETY: Every byte in `0..total_len` was initialized row-by-row above.
+    unsafe { buffer.set_len(total_len) };
+    buffer
+}
+
 #[derive(Debug)]
 struct StreamOutputVars {
     tx: SyncSender<Frame>,
@@ -186,6 +232,7 @@ struct StreamOutputVars {
     hdr: bool,
     /// Cached extended sRGB → linear lookup for RGhA frames.
     srgb_lut: Option<&'static [u16; 65_536]>,
+    buffer_pool: Option<FrameBufferPool>,
     biplanar_logged: AtomicBool,
     unsupported_format_logged: AtomicU32,
 }
@@ -238,24 +285,13 @@ impl StreamOutputVars {
                         return;
                     }
                     let data = slice::from_raw_parts(base_address.cast::<u8>(), size);
-                    let mut buffer = vec![0; row_len * height];
-                    for (src_row, dst_row) in data
-                        .chunks(bytes_per_row)
-                        .take(height)
-                        .zip(buffer.chunks_exact_mut(row_len))
-                    {
-                        for (src, dst) in src_row[..row_len]
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .zip(dst_row.as_chunks_mut::<4>().0)
-                        {
-                            dst[0] = src[2];
-                            dst[1] = src[1];
-                            dst[2] = src[0];
-                            dst[3] = src[3];
-                        }
-                    }
+                    let buffer = bgra_to_rgba_into(
+                        data,
+                        width,
+                        height,
+                        bytes_per_row,
+                        self.buffer_pool.as_ref(),
+                    );
                     Frame::new_at(width_u32, height_u32, buffer, timestamp)
                 }
                 PIXEL_FORMAT_420V => {
@@ -419,6 +455,7 @@ impl StreamOutput {
         created: Instant,
         hdr: bool,
         srgb_lut: Option<&'static [u16; 65_536]>,
+        buffer_pool: Option<FrameBufferPool>,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(StreamOutputVars {
             tx,
@@ -426,6 +463,7 @@ impl StreamOutput {
             created,
             hdr,
             srgb_lut,
+            buffer_pool,
             biplanar_logged: AtomicBool::new(false),
             unsupported_format_logged: AtomicU32::new(0),
         });
@@ -541,14 +579,25 @@ impl ImplVideoRecorder {
             240
         };
 
-        let (tx, rx) = sync_channel(if high_fps { 6 } else { 4 });
+        let channel_cap = options
+            .channel_capacity
+            .map(|c| c.clamp(1, 16))
+            .unwrap_or(if high_fps { 6 } else { 4 });
+        let (tx, rx) = sync_channel(channel_cap);
         let running = Arc::new(AtomicBool::new(false));
         // HDR streaming needs Apple Silicon and macOS 15; asking on an older
         // Mac silently keeps the SDR stream, so only build the lookup when the
         // frames can actually arrive as RGhA.
         let hdr_enabled = options.dynamic_range == DynamicRange::Hdr && hdr::supported();
         let srgb_lut = hdr_enabled.then(hdr::srgb_to_linear_lut);
-        let output = StreamOutput::new(tx, running.clone(), created, hdr_enabled, srgb_lut);
+        let output = StreamOutput::new(
+            tx,
+            running.clone(),
+            created,
+            hdr_enabled,
+            srgb_lut,
+            options.buffer_pool.clone(),
+        );
         let queue = DispatchQueue::new("XCapStreamOutput", DispatchQueueAttr::SERIAL);
 
         unsafe {
@@ -571,7 +620,13 @@ impl ImplVideoRecorder {
             configuration.setSourceRect(source_rect);
             configuration.setScalesToFit(false);
             configuration.setShowsCursor(options.captures_cursor);
-            configuration.setQueueDepth(if high_fps { 8 } else { 5 });
+            configuration.setQueueDepth(if high_fps {
+                8
+            } else if channel_cap <= 2 {
+                3
+            } else {
+                5
+            });
             configuration.setMinimumFrameInterval(CMTime::new(1, target_hz));
 
             let stream = SCStream::initWithFilter_configuration_delegate(
@@ -749,5 +804,41 @@ mod tests {
                 .iter()
                 .all(|p| p == &[128, 128, 128, 255])
         );
+    }
+
+    #[test]
+    fn bgra_to_rgba_handles_padding_tails_and_pool_reuse() {
+        let pool = FrameBufferPool::new(2);
+        for width in [1usize, 15, 16, 17, 33] {
+            let height = 3;
+            let row_len = width * 4;
+            let stride = row_len + 12;
+            let mut src = vec![0xAAu8; stride * height];
+            let mut expected = Vec::with_capacity(row_len * height);
+            for y in 0..height {
+                for x in 0..width {
+                    let b = ((x * 7 + y * 13) & 0xff) as u8;
+                    let g = ((x * 11 + y * 5 + 40) & 0xff) as u8;
+                    let r = ((x * 19 + y * 3 + 90) & 0xff) as u8;
+                    let a = ((x + y + 200) & 0xff) as u8;
+                    let off = y * stride + x * 4;
+                    src[off..off + 4].copy_from_slice(&[b, g, r, a]);
+                    expected.extend_from_slice(&[r, g, b, a]);
+                }
+            }
+
+            let out = bgra_to_rgba_into(&src, width, height, stride, Some(&pool));
+            assert_eq!(out, expected, "width={width}");
+            let ptr = out.as_ptr();
+            pool.recycle(out);
+
+            let reused = bgra_to_rgba_into(&src, width, height, stride, Some(&pool));
+            assert_eq!(reused, expected, "width={width}");
+            assert_eq!(
+                reused.as_ptr(),
+                ptr,
+                "expected buffer reuse for width={width}"
+            );
+        }
     }
 }

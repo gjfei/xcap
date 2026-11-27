@@ -94,7 +94,11 @@ impl ImplVideoRecorder {
             Self::open_sdr(h_monitor)?
         };
 
-        let (tx, rx) = sync_channel(FRAME_QUEUE_CAPACITY);
+        let channel_cap = options
+            .channel_capacity
+            .map(|c| c.clamp(1, 16))
+            .unwrap_or(FRAME_QUEUE_CAPACITY);
+        let (tx, rx) = sync_channel(channel_cap);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let recorder_waker = Arc::new(RecorderWaker::new());
         let region = options.region;
@@ -123,6 +127,7 @@ impl ImplVideoRecorder {
                     worker_waker,
                     tx,
                     queue_depth,
+                    channel_cap,
                     region,
                     interval,
                     created,
@@ -337,6 +342,7 @@ fn run_hdr(
     recorder_waker: Arc<RecorderWaker>,
     tx: SyncSender<Frame>,
     queue_depth: Arc<AtomicUsize>,
+    channel_cap: usize,
     region: Option<CaptureRegion>,
     interval: Option<Duration>,
     created: Instant,
@@ -361,7 +367,7 @@ fn run_hdr(
                 return Ok(());
             }
         }
-        let Some(permit) = QueuePermit::acquire(queue_depth.clone(), FRAME_QUEUE_CAPACITY) else {
+        let Some(permit) = QueuePermit::acquire(queue_depth.clone(), channel_cap) else {
             // The receiver has not made room yet. Skip before DXGI grab and
             // HDR decode rather than paying for a frame that would be dropped.
             let backoff = interval
